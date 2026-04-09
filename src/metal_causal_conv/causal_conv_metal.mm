@@ -46,7 +46,8 @@ static inline id<MTLBuffer> getMTLBufferStorage(const torch::Tensor &tensor) {
 struct MetalState {
   id<MTLDevice> device = nil;
   id<MTLLibrary> library = nil;
-  id<MTLComputePipelineState> pipeline = nil;
+  id<MTLComputePipelineState> pipeline_float = nil;
+  id<MTLComputePipelineState> pipeline_half = nil;
   bool initialized = false;
 };
 
@@ -80,16 +81,21 @@ static void ensureInitialized(const std::string &shader_path) {
     TORCH_CHECK(error == nil, "Failed to compile Metal shader: ",
                 [[error localizedDescription] UTF8String]);
 
-    id<MTLFunction> function =
-        [state.library newFunctionWithName:@"causal_conv_with_state_fwd"];
-    TORCH_CHECK(
-        function != nil,
-        "Metal function 'causal_conv_with_state_fwd' not found in shader");
+    id<MTLFunction> func_float =
+        [state.library newFunctionWithName:@"causal_conv_with_state_fwd_float"];
+    id<MTLFunction> func_half =
+        [state.library newFunctionWithName:@"causal_conv_with_state_fwd_half"];
+    
+    TORCH_CHECK(func_float != nil && func_half != nil,
+                "Metal functions not found in shader");
 
-    state.pipeline = [state.device newComputePipelineStateWithFunction:function
-                                                                 error:&error];
-    TORCH_CHECK(error == nil, "Failed to create compute pipeline: ",
-                [[error localizedDescription] UTF8String]);
+    state.pipeline_float = [state.device newComputePipelineStateWithFunction:func_float
+                                                                       error:&error];
+    TORCH_CHECK(error == nil, "Failed to create float pipeline");
+    
+    state.pipeline_half = [state.device newComputePipelineStateWithFunction:func_half
+                                                                      error:&error];
+    TORCH_CHECK(error == nil, "Failed to create half pipeline");
 
     state.initialized = true;
   }
@@ -140,58 +146,62 @@ causal_conv_with_state_fwd(torch::Tensor input,      // (B, D, L)
     params.has_conv_state = has_conv_state ? 1 : 0;
     params.use_silu = use_silu ? 1 : 0;
 
+    // Select pipeline based on dtype
+    id<MTLComputePipelineState> pso = (input.scalar_type() == torch::kHalf) 
+                                       ? state.pipeline_half 
+                                       : state.pipeline_float;
+
     // Get the active PyTorch MPS compute encoder
     id<MTLComputeCommandEncoder> encoder =
         at::mps::getCurrentMPSStream()->commandEncoder();
     TORCH_CHECK(encoder != nil, "Failed to get PyTorch active compute encoder");
 
-    [encoder setComputePipelineState:state.pipeline];
+    [encoder setComputePipelineState:pso];
+
+    size_t element_size = (input.scalar_type() == torch::kHalf) ? 2 : 4;
 
     // Bind input and output buffers
     [encoder setBuffer:getMTLBufferStorage(input)
-                offset:input.storage_offset() * sizeof(float)
+                offset:input.storage_offset() * element_size
                atIndex:0];
     [encoder setBuffer:getMTLBufferStorage(weight)
-                offset:weight.storage_offset() * sizeof(float)
+                offset:weight.storage_offset() * element_size
                atIndex:1];
 
     [encoder setBuffer:has_bias ? getMTLBufferStorage(bias)
                                 : getMTLBufferStorage(dummy)
-                offset:has_bias ? bias.storage_offset() * sizeof(float) : 0
+                offset:has_bias ? bias.storage_offset() * element_size : 0
                atIndex:2];
 
     [encoder
         setBuffer:has_conv_state ? getMTLBufferStorage(conv_state)
                                  : getMTLBufferStorage(dummy)
-           offset:has_conv_state ? conv_state.storage_offset() * sizeof(float)
+           offset:has_conv_state ? conv_state.storage_offset() * element_size
                                  : 0
           atIndex:3];
 
     [encoder setBuffer:getMTLBufferStorage(output)
-                offset:output.storage_offset() * sizeof(float)
+                offset:output.storage_offset() * element_size
                atIndex:4];
     [encoder setBuffer:getMTLBufferStorage(present_state)
-                offset:present_state.storage_offset() * sizeof(float)
+                offset:present_state.storage_offset() * element_size
                atIndex:5];
 
     // Set unified struct via a single setBytes call
     [encoder setBytes:&params length:sizeof(CausalConvParams) atIndex:6];
 
-    // Setup 3D Grid: (Length, Channels, Batch) to eliminate inner integer
-    // division
-    MTLSize gridSize = MTLSizeMake(L, D, B);
+    // Setup 2D Grid: (Channels, Batch)
+    MTLSize gridSize = MTLSizeMake(D, B, 1);
 
-    // Optimize Threadgroup Size based on device limits
-    NSUInteger maxThreads = state.pipeline.maxTotalThreadsPerThreadgroup;
-    NSUInteger tg_x = MIN((NSUInteger)L, maxThreads);
-    NSUInteger tg_y = MIN((NSUInteger)D, maxThreads / tg_x);
+    // Optimize Threadgroup Size
+    NSUInteger maxThreads = pso.maxTotalThreadsPerThreadgroup;
+    NSUInteger tg_x = MIN((NSUInteger)D, maxThreads);
+    NSUInteger tg_y = MIN((NSUInteger)B, maxThreads / tg_x);
     MTLSize groupSize = MTLSizeMake(tg_x, tg_y, 1);
 
     // Dispatch
     [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
 
-    // Note: PyTorch MPSStream manages ending the encoding and committing the
-    // buffer.
     return {output, present_state};
   }
 }
