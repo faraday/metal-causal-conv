@@ -190,14 +190,17 @@ causal_conv_with_state_fwd(torch::Tensor input,      // (B, D, L)
     // Set unified struct via a single setBytes call
     [encoder setBytes:&params length:sizeof(CausalConvParams) atIndex:6];
 
-    // Setup 2D Grid: (Channels, Batch)
-    MTLSize gridSize = MTLSizeMake(D, B, 1);
+    // Setup 3D Grid: (Length, Channels, Batch)
+    MTLSize gridSize = MTLSizeMake(L, D, B);
 
     // Optimize Threadgroup Size
+    // We want a large N in the L dimension to maximize shared memory reuse.
+    // However, N must not exceed MAX_TILE_SIZE (512) or hardware limits.
     NSUInteger maxThreads = pso.maxTotalThreadsPerThreadgroup;
-    NSUInteger tg_x = MIN((NSUInteger)D, maxThreads);
-    NSUInteger tg_y = MIN((NSUInteger)B, maxThreads / tg_x);
-    MTLSize groupSize = MTLSizeMake(tg_x, tg_y, 1);
+    NSUInteger tg_x = MIN((NSUInteger)L, MIN((NSUInteger)256, maxThreads)); 
+    NSUInteger tg_y = 1; // 1 channel per group for simplicity and shared memory alignment
+    NSUInteger tg_z = 1;
+    MTLSize groupSize = MTLSizeMake(tg_x, tg_y, tg_z);
 
     // Dispatch
     [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
