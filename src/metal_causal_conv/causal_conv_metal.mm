@@ -190,17 +190,16 @@ causal_conv_with_state_fwd(torch::Tensor input,      // (B, D, L)
     // Set unified struct via a single setBytes call
     [encoder setBytes:&params length:sizeof(CausalConvParams) atIndex:6];
 
-    // Setup 3D Grid: (Length, Channels, Batch)
-    MTLSize gridSize = MTLSizeMake(L, D, B);
+    // Flat 1D Grid: total threads = B * D * L
+    // Each thread computes one output element, indexed by flat thread ID.
+    // No shared memory or barriers — Apple Silicon L1 cache handles K-element overlap.
+    NSUInteger total = (NSUInteger)B * (NSUInteger)D * (NSUInteger)L;
+    MTLSize gridSize = MTLSizeMake(total, 1, 1);
 
-    // Optimize Threadgroup Size
-    // We want a large N in the L dimension to maximize shared memory reuse.
-    // However, N must not exceed MAX_TILE_SIZE (512) or hardware limits.
+    // Pack threadgroups as tightly as the hardware allows
     NSUInteger maxThreads = pso.maxTotalThreadsPerThreadgroup;
-    NSUInteger tg_x = MIN((NSUInteger)L, MIN((NSUInteger)256, maxThreads)); 
-    NSUInteger tg_y = 1; // 1 channel per group for simplicity and shared memory alignment
-    NSUInteger tg_z = 1;
-    MTLSize groupSize = MTLSizeMake(tg_x, tg_y, tg_z);
+    NSUInteger tg_x = MIN(total, maxThreads);
+    MTLSize groupSize = MTLSizeMake(tg_x, 1, 1);
 
     // Dispatch
     [encoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];

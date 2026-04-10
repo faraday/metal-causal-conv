@@ -1,11 +1,13 @@
 /******************************************************************************
- * Metal CausalConvWithState — Tiled Shared-Memory Fused Optimization
+ * Metal CausalConvWithState — Flat 1D High-Occupancy Kernel
  *
- * Parallelizes across BOTH Sequence Length (L) and Channels (D).
- * Uses Threadgroup Memory (Shared Memory) to cache input motifs, avoiding
- * redundant global memory reads and maximizing GPU occupancy.
+ * Eliminates shared memory and threadgroup barriers entirely.
+ * Each thread computes ONE output element from a flat thread index
+ * over the (B × D × L) output space. Apple Silicon L1/L2 cache
+ * handles the small K-element overlap naturally (K is typically 3–4).
  *
- * Each thread computes ONE output element.
+ * This maximizes GPU occupancy by allowing the driver full freedom
+ * in threadgroup packing — no per-channel threadgroup partitioning.
  *
  * Copyright 2026. MIT License.
  ******************************************************************************/
@@ -29,12 +31,8 @@ inline T silu(T x) {
     return x / (1.0f + exp(-x));
 }
 
-// We use a fixed maximum tile size for shared memory to simplify allocation.
-// For L=256, a tile of 256 + 3 is plenty.
-#define MAX_TILE_SIZE 512
-
 template<typename T>
-void causal_conv_tiled_impl(
+void causal_conv_flat_impl(
     device const T* input,
     device const T* weight,
     device const T* bias,
@@ -42,89 +40,64 @@ void causal_conv_tiled_impl(
     device T* output,
     device T* present_state,
     constant CausalConvParams& params,
-    threadgroup T* s_input,
-    uint3 gid,
-    uint3 tid,
-    uint3 tgid,
-    uint3 threads_per_group)
+    uint tid)
 {
-    // Hierarchical indices
-    const uint pos = gid.x;
-    const uint channel_idx = gid.y;
-    const uint batch_idx = gid.z;
-
-    const uint l_tid = tid.x; // Local thread ID in the tile
+    const uint L = params.input_length;
+    const uint D = params.channels;
     const uint K = params.kernel_size;
     const uint state_len = params.state_length;
-    const uint L = params.input_length;
+    const uint total = params.batch_size * D * L;
 
-    // Base pointers
-    const uint weight_base = channel_idx * K;
-    const uint state_base = (batch_idx * params.channels + channel_idx) * state_len;
-    const uint data_base = (batch_idx * params.channels + channel_idx) * L;
+    if (tid >= total) return;
 
-    // 1. Cooperative Loading of Input + Halo into Shared Memory
-    // Each threadgroup handles a block of N threads in the 'L' dimension.
-    // We need to load input[start...end] AND input[start-state_len...start-1]
-    
-    const uint tile_start = tgid.x * threads_per_group.x;
-    
-    // Load main data
-    if (pos < L) {
-        s_input[state_len + l_tid] = input[data_base + pos];
-    }
-    
-    // Load halo (the state_len elements before this tile)
-    if (l_tid < state_len) {
-        if (tile_start == 0) {
-            // First tile: load from conv_state
-            if (params.has_conv_state) {
-                s_input[l_tid] = conv_state[state_base + l_tid];
-            } else {
-                s_input[l_tid] = (T)0.0f;
-            }
-        } else {
-            // Subsequent tile: load from previous global input data
-            s_input[l_tid] = input[data_base + tile_start - state_len + l_tid];
-        }
-    }
+    // Decode flat index → (batch, channel, position)
+    const uint l = tid % L;
+    const uint d = (tid / L) % D;
+    const uint b = tid / (L * D);
 
-    // Synchronize to ensure all data is in shared memory
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint data_base  = (b * D + d) * L;
+    const uint state_base = (b * D + d) * state_len;
+    const uint weight_base = d * K;
 
-    if (pos >= L || channel_idx >= params.channels || batch_idx >= params.batch_size) {
-        return;
-    }
-
-    // 2. Convolution Computation
-    // All inputs are now in s_input. Weights are small enough for registers.
-    T w[32];
-    for (uint j = 0; j < K; j++) {
-        w[j] = weight[weight_base + j];
-    }
-
+    // Convolution: dot product of K elements
     float acc = 0.0f;
     for (uint j = 0; j < K; j++) {
-        acc += (float)s_input[l_tid + j] * (float)w[j];
+        int src_pos = (int)l - (int)state_len + (int)j;
+        float val;
+        if (src_pos < 0) {
+            // Read from convolution state (past chunk's tail)
+            val = params.has_conv_state
+                ? (float)conv_state[state_base + (uint)((int)state_len + src_pos)]
+                : 0.0f;
+        } else {
+            val = (float)input[data_base + (uint)src_pos];
+        }
+        acc += val * (float)weight[weight_base + j];
     }
 
     if (params.has_bias) {
-        acc += (float)bias[channel_idx];
+        acc += (float)bias[d];
     }
 
     if (params.use_silu) {
-        acc = (float)silu((float)acc);
+        acc = (float)silu(acc);
     }
 
-    output[data_base + pos] = (T)acc;
+    output[data_base + l] = (T)acc;
 
-    // 3. State Update
-    // The very last threads of the sequence write back the present_state.
-    if (pos == L - 1) {
+    // State update: last position in the sequence writes present_state
+    if (l == L - 1) {
         for (uint j = 0; j < state_len; j++) {
-            // present_state is the last (K-1) elements of the virtual input
-            // virtual input at the end is s_input[l_tid + 1 ... l_tid + state_len]
-            present_state[state_base + j] = s_input[l_tid + 1 + j];
+            int src = (int)l - (int)state_len + 1 + (int)j;
+            float s;
+            if (src < 0) {
+                s = params.has_conv_state
+                    ? (float)conv_state[state_base + (uint)((int)state_len + src)]
+                    : 0.0f;
+            } else {
+                s = (float)input[data_base + (uint)src];
+            }
+            present_state[state_base + j] = (T)s;
         }
     }
 }
@@ -138,13 +111,9 @@ kernel void causal_conv_with_state_fwd_float(
     device float* output              [[buffer(4)]],
     device float* present_state       [[buffer(5)]],
     constant CausalConvParams& params [[buffer(6)]],
-    uint3 gid                         [[thread_position_in_grid]],
-    uint3 tid                         [[thread_position_in_threadgroup]],
-    uint3 tgid                        [[threadgroup_position_in_grid]],
-    uint3 threads_per_group           [[threads_per_threadgroup]])
+    uint tid                          [[thread_position_in_grid]])
 {
-    threadgroup float s_input[MAX_TILE_SIZE + 32];
-    causal_conv_tiled_impl<float>(input, weight, bias, conv_state, output, present_state, params, s_input, gid, tid, tgid, threads_per_group);
+    causal_conv_flat_impl<float>(input, weight, bias, conv_state, output, present_state, params, tid);
 }
 
 kernel void causal_conv_with_state_fwd_half(
@@ -155,11 +124,7 @@ kernel void causal_conv_with_state_fwd_half(
     device half* output               [[buffer(4)]],
     device half* present_state        [[buffer(5)]],
     constant CausalConvParams& params [[buffer(6)]],
-    uint3 gid                         [[thread_position_in_grid]],
-    uint3 tid                         [[thread_position_in_threadgroup]],
-    uint3 tgid                        [[threadgroup_position_in_grid]],
-    uint3 threads_per_group           [[threads_per_threadgroup]])
+    uint tid                          [[thread_position_in_grid]])
 {
-    threadgroup half s_input[MAX_TILE_SIZE + 32];
-    causal_conv_tiled_impl<half>(input, weight, bias, conv_state, output, present_state, params, s_input, gid, tid, tgid, threads_per_group);
+    causal_conv_flat_impl<half>(input, weight, bias, conv_state, output, present_state, params, tid);
 }
