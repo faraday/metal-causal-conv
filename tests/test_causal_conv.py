@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Tests for metal_causal_conv — CausalConvWithState + fused SiLU on Metal.
 

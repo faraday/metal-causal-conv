@@ -1,9 +1,8 @@
-"""
-Metal-accelerated CausalConvWithState for Apple Silicon.
+# SPDX-License-Identifier: Apache-2.0
+"""Metal CausalConvWithState reference kernel for Apple Silicon.
 
 Fused depthwise causal convolution with persistent state carry and optional
-SiLU activation. Drop-in replacement for the Conv1d + silu pattern used in
-Mamba / Gated DeltaNet preprocessing.
+SiLU activation for inference with PyTorch/MPS.
 
 Inputs:
     input:      (B, D, L) — input tensor

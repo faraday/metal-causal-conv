@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /******************************************************************************
  * Objective-C++ bridge for the Metal CausalConvWithState kernel.
  *

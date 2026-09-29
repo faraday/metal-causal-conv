@@ -9,7 +9,8 @@
  * This maximizes GPU occupancy by allowing the driver full freedom
  * in threadgroup packing — no per-channel threadgroup partitioning.
  *
- * Copyright 2026. MIT License.
+ * Copyright 2026 Çağatay Çallı.
+ * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
 
 #include <metal_stdlib>

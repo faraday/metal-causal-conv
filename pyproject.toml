@@ -1,14 +1,16 @@
 [build-system]
-requires = ["setuptools>=64", "wheel", "torch>=2.0.0", "ninja"]
+requires = ["setuptools>=77", "wheel", "torch>=2.0.0", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-causal-conv"
 version = "0.1.0"
-description = "Fused CausalConvWithState + SiLU Metal kernel for Apple Silicon"
+description = "Stateful causal depthwise convolution Metal kernel for Apple Silicon with PyTorch/MPS"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Çağatay Çallı", email = "cagataycalli@gmail.com"}
 ]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,6 +26,3 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.uv]
-managed = true

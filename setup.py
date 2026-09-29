@@ -1,17 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Build script for the Metal CausalConvWithState PyTorch extension.
 
 Usage:
-    pip install -e .
+    python -m pip install --no-build-isolation -e .
 """
 import os
 import torch
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CppExtension, BuildExtension
 
-# Only build for MPS (Apple Silicon)
-assert hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(), \
-    "MPS (Apple Silicon) is required to build this extension"
+# Building needs the Apple SDK and PyTorch headers. MPS availability is a
+# runtime requirement and is checked by the native Metal dispatch.
 
 # Handle .mm (Objective-C++) files
 from distutils.unixccompiler import UnixCCompiler
@@ -25,7 +25,7 @@ os.environ['USE_NINJA'] = '1'
 # Compile flags for Objective-C++ with Metal framework
 extra_compile_args = {
     'cxx': [
-        '-std=c++17',
+        '-std=c++20',
         '-O3',
     ],
 }
@@ -43,9 +43,11 @@ ext_modules = [
 ]
 
 setup(
-    name='metal_causal_conv',
+    name='metal-causal-conv',
     version='0.1.0',
-    description='Fused CausalConvWithState + SiLU Metal kernel for Apple Silicon',
+    description='Stateful causal depthwise convolution Metal kernel for Apple Silicon with PyTorch/MPS',
+    author='Çağatay Çallı',
+    author_email='cagataycalli@gmail.com',
     packages=find_packages(where='src'),
     package_dir={'': 'src'},
     ext_modules=ext_modules,
